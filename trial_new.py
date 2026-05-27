@@ -2,9 +2,10 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from groq import Groq
-import PyPDF2
 import io
 import json
+import re
+import base64
 import faiss
 from sklearn.preprocessing import MinMaxScaler
 
@@ -53,37 +54,38 @@ def load_and_index():
 df, faiss_index, scaler = load_and_index()
 st.success(f"✅ {len(df)} songs indexed and ready")
 
-# ─── PDF Playlist Parser ───────────────────────────────────────────────────────
-def extract_songs_from_pdf(pdf_file):
-    reader = PyPDF2.PdfReader(pdf_file)
-    text = ""
-    for page in reader.pages:
-        text += page.extract_text() or ""
-    return text
-
-def parse_playlist_with_llm(text):
-    prompt = f"""Extract all song names and artists from this playlist text.
-Return ONLY a JSON array like: [{{"song": "...", "artist": "..."}}]
-No extra text, no markdown.
-
-Playlist text:
-{text[:3000]}"""
-
+# ─── Screenshot → Songs via Groq Vision ───────────────────────────────────────
+def extract_tracks_from_screenshot(image_bytes: bytes, media_type: str):
+    b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
     resp = client.chat.completions.create(
-        model=st.session_state.get("model", "llama3-70b-8192"),
-        messages=[{"role": "user", "content": prompt}],
+        model="meta-llama/llama-4-scout-17b-16e-instruct",
+        messages=[{
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{media_type};base64,{b64}"},
+                },
+                {
+                    "type": "text",
+                    "text": (
+                        "This is a screenshot of a music playlist (e.g. Spotify, Apple Music, YouTube Music). "
+                        "Extract every visible track. Return ONLY a valid JSON array — no markdown, no explanation. "
+                        "Each object: {\"song\": \"track name\", \"artist\": \"artist name\"}. "
+                        "If artist is not visible use an empty string. Be thorough — extract ALL tracks visible."
+                    ),
+                },
+            ],
+        }],
         temperature=0.1,
-        max_tokens=1000
+        max_tokens=2000,
     )
-    try:
-        raw = resp.choices[0].message.content.strip()
-        raw = raw.replace("```json", "").replace("```", "").strip()
-        return json.loads(raw)
-    except:
-        return []
+    raw = resp.choices[0].message.content.strip()
+    raw = re.sub(r"```json|```", "", raw).strip()
+    return json.loads(raw)
 
+# ─── Playlist → Feature Vector ─────────────────────────────────────────────────
 def get_playlist_feature_vector(songs):
-    """Average feature vector of matched songs from the dataset."""
     vectors = []
     for item in songs:
         match = df[
@@ -109,24 +111,21 @@ MOOD_VECTORS = {
 }
 
 ENERGY_VECTORS = {
-    "High Beat":   dict(tempo=0.9, energy=0.9, danceability=0.8),
-    "Medium":      dict(tempo=0.5, energy=0.5),
-    "Low / Calm":  dict(tempo=0.2, energy=0.2, acousticness=0.7),
+    "High Beat":  dict(tempo=0.9, energy=0.9, danceability=0.8),
+    "Medium":     dict(tempo=0.5, energy=0.5),
+    "Low / Calm": dict(tempo=0.2, energy=0.2, acousticness=0.7),
 }
 
 def build_query_vector(mood=None, energy=None, genre=None, playlist_vec=None):
     base = {col: 0.5 for col in FEATURE_COLS}
-
     if mood and mood in MOOD_VECTORS:
         base.update(MOOD_VECTORS[mood])
     if energy and energy in ENERGY_VECTORS:
         base.update(ENERGY_VECTORS[energy])
 
     vec = np.array([base[c] for c in FEATURE_COLS], dtype='float32')
-
     if playlist_vec is not None:
-        vec = 0.5 * vec + 0.5 * playlist_vec  # blend user taste with filters
-
+        vec = 0.5 * vec + 0.5 * playlist_vec
     return vec.reshape(1, -1)
 
 # ─── RAG Retrieval ─────────────────────────────────────────────────────────────
@@ -143,7 +142,6 @@ def retrieve_songs(query_vec, genre=None, artist_filter=None, k=50):
         results = results[
             results['artists'].str.lower().str.contains(artist_filter.lower(), na=False)
         ]
-
     return results.head(k)
 
 # ─── ReAct Agent ───────────────────────────────────────────────────────────────
@@ -191,7 +189,17 @@ Format your final answer as:
     )
     return resp.choices[0].message.content
 
-# ─── Sidebar: Filters & Upload ─────────────────────────────────────────────────
+# ─── Multi-Chat Session State Init ────────────────────────────────────────────
+# Structure: st.session_state.chats = { "Chat 1": { "messages": [], "playlist_songs": [] } }
+if "chats" not in st.session_state:
+    st.session_state.chats = {"Chat 1": {"messages": [], "playlist_songs": None}}
+if "active_chat" not in st.session_state:
+    st.session_state.active_chat = "Chat 1"
+
+def current_chat():
+    return st.session_state.chats[st.session_state.active_chat]
+
+# ─── Sidebar ──────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("🎛️ Filters")
 
@@ -212,72 +220,109 @@ with st.sidebar:
 
     st.divider()
 
-    st.subheader("📄 Upload Your Playlist (PDF)")
-    pdf_file = st.file_uploader("Upload playlist PDF", type=["pdf"])
+    # ── Screenshot Upload ──────────────────────────────────────────────────────
+    st.subheader("📸 Upload Playlist Screenshot")
+    uploaded_img = st.file_uploader("Upload a screenshot of any playlist",
+                                    type=["png", "jpg", "jpeg", "webp"])
 
-    playlist_songs = None
-    playlist_vec = None
+    playlist_songs = current_chat().get("playlist_songs")
+    playlist_vec   = get_playlist_feature_vector(playlist_songs) if playlist_songs else None
 
-    if pdf_file:
-        with st.spinner("Reading your playlist..."):
-            text = extract_songs_from_pdf(pdf_file)
-            playlist_songs = parse_playlist_with_llm(text)
-            if playlist_songs:
-                playlist_vec = get_playlist_feature_vector(playlist_songs)
-                st.success(f"✅ Found {len(playlist_songs)} songs in your playlist")
+    if uploaded_img and st.button("Extract Tracks"):
+        with st.spinner("Reading screenshot with Groq Vision..."):
+            try:
+                mt = uploaded_img.type or "image/png"
+                songs = extract_tracks_from_screenshot(uploaded_img.read(), mt)
+                current_chat()["playlist_songs"] = songs
+                playlist_songs = songs
+                playlist_vec   = get_playlist_feature_vector(songs)
+                st.success(f"✅ Extracted {len(songs)} tracks")
                 with st.expander("Detected songs"):
-                    for s in playlist_songs[:10]:
+                    for s in songs[:15]:
                         st.write(f"• {s['song']} — {s['artist']}")
-            else:
-                st.warning("Couldn't parse songs from PDF. Try a text-based PDF.")
+            except Exception as e:
+                st.error(f"❌ Could not extract tracks: {e}")
+
+    elif playlist_songs:
+        st.success(f"✅ {len(playlist_songs)} tracks loaded")
+        with st.expander("Loaded songs"):
+            for s in playlist_songs[:15]:
+                st.write(f"• {s['song']} — {s['artist']}")
 
     st.divider()
-    if st.button("🗑️ Clear Chat"):
-        st.session_state.messages = []
+
+    # ── Multi-Chat Manager ─────────────────────────────────────────────────────
+    st.subheader("💬 Chat Sessions")
+
+    chat_names = list(st.session_state.chats.keys())
+    selected = st.radio("Switch chat", chat_names, 
+                        index=chat_names.index(st.session_state.active_chat),
+                        key="chat_selector")
+    if selected != st.session_state.active_chat:
+        st.session_state.active_chat = selected
         st.rerun()
 
-# ─── Chat UI ───────────────────────────────────────────────────────────────────
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+    # New chat
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        new_name = st.text_input("New chat name", placeholder="e.g. Workout Mix",
+                                  label_visibility="collapsed")
+    with col2:
+        if st.button("➕") and new_name.strip():
+            if new_name.strip() not in st.session_state.chats:
+                st.session_state.chats[new_name.strip()] = {"messages": [], "playlist_songs": None}
+                st.session_state.active_chat = new_name.strip()
+                st.rerun()
+
+    # Delete current chat
+    if len(st.session_state.chats) > 1:
+        if st.button(f"🗑️ Delete '{st.session_state.active_chat}'"):
+            del st.session_state.chats[st.session_state.active_chat]
+            st.session_state.active_chat = list(st.session_state.chats.keys())[0]
+            st.rerun()
+
+    if st.button("🗑️ Clear Current Chat"):
+        current_chat()["messages"] = []
+        st.rerun()
+
+# ─── Chat UI ──────────────────────────────────────────────────────────────────
+st.subheader(f"💬 {st.session_state.active_chat}")
 
 # Show active filters
 active = []
-if mood != "Any": active.append(f"😊 {mood}")
-if energy != "Any": active.append(f"⚡ {energy}")
-if genre != "Any": active.append(f"🎸 {genre}")
-if artist_filter: active.append(f"🎤 {artist_filter}")
-if playlist_vec is not None: active.append("📄 Playlist loaded")
+if mood != "Any":            active.append(f"😊 {mood}")
+if energy != "Any":          active.append(f"⚡ {energy}")
+if genre != "Any":           active.append(f"🎸 {genre}")
+if artist_filter:            active.append(f"🎤 {artist_filter}")
+if playlist_vec is not None: active.append("📸 Playlist loaded")
 
 if active:
     st.info("Active filters: " + " · ".join(active))
 
-for m in st.session_state.messages:
+messages = current_chat()["messages"]
+
+for m in messages:
     with st.chat_message(m["role"]):
         st.markdown(m["content"])
 
 if prompt := st.chat_input("🎤 Tell me what you're in the mood for..."):
-    st.session_state.messages.append({"role": "user", "content": prompt})
+    messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
 
     with st.chat_message("assistant"):
         with st.spinner("Finding your perfect songs..."):
-            # Build query vector from filters + playlist
             query_vec = build_query_vector(
                 mood=mood if mood != "Any" else None,
                 energy=energy if energy != "Any" else None,
                 genre=genre if genre != "Any" else None,
                 playlist_vec=playlist_vec
             )
-
-            # RAG: retrieve from FAISS
             retrieved = retrieve_songs(
                 query_vec,
                 genre=genre,
                 artist_filter=artist_filter if artist_filter else None
             )
-
-            # ReAct: LLM reasons over retrieved songs
             filters_used = {
                 "mood": mood, "energy": energy,
                 "genre": genre, "artist": artist_filter
@@ -286,7 +331,6 @@ if prompt := st.chat_input("🎤 Tell me what you're in the mood for..."):
                 prompt, retrieved, filters_used,
                 playlist_context=playlist_songs
             )
-
             st.markdown(response)
 
-    st.session_state.messages.append({"role": "assistant", "content": response})
+    messages.append({"role": "assistant", "content": response})
