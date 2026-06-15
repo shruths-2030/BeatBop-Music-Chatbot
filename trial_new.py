@@ -88,12 +88,22 @@ def extract_tracks_from_screenshot(image_bytes: bytes, media_type: str):
 def get_playlist_feature_vector(songs):
     vectors = []
     for item in songs:
-        match = df[
-            df['track_name'].str.lower().str.contains(item['song'].lower(), na=False) |
-            df['artists'].str.lower().str.contains(item['artist'].lower(), na=False)
-        ]
+        song_name = item['song'].lower().strip()
+        artist_name = item['artist'].lower().strip()
+
+        # Match by song name first
+        name_match = df[df['track_name'].str.lower().str.contains(song_name, na=False, regex=False)]
+
+        # If artist is available, narrow it down further
+        if artist_name and not name_match.empty:
+            artist_match = name_match[name_match['artists'].str.lower().str.contains(artist_name, na=False, regex=False)]
+            match = artist_match if not artist_match.empty else name_match
+        else:
+            match = name_match
+
         if not match.empty:
-            vectors.append(match[FEATURE_COLS].mean().values)
+            vectors.append(match[FEATURE_COLS].iloc[0].values)  # take first match, not mean
+
     if vectors:
         return np.mean(vectors, axis=0).astype('float32')
     return None
@@ -104,7 +114,7 @@ MOOD_VECTORS = {
     "Sad":       dict(valence=0.2, energy=0.3, acousticness=0.7),
     "Party":     dict(danceability=0.9, energy=0.9, valence=0.7),
     "Chill":     dict(energy=0.3, acousticness=0.6, tempo=0.3),
-    "Angry":     dict(energy=0.9, valence=0.2, loudness=0.9),
+    "Angry":     dict(energy=0.95, valence=0.1, speechiness=0.7, danceability=0.4),
     "Romantic":  dict(valence=0.6, acousticness=0.6, energy=0.4),
     "Uplifting": dict(valence=0.85, energy=0.75, danceability=0.65),
     "Focus":     dict(instrumentalness=0.7, energy=0.4, speechiness=0.1),
