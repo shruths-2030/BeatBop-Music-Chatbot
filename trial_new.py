@@ -241,7 +241,11 @@ def react_agent(user_query, retrieved_songs, filters, playlist_context=None):
 
     playlist_info = ""
     if playlist_context:
-        playlist_info = f"\nUser's playlist taste profile:\n{json.dumps(playlist_context[:5], indent=2)}"
+        playlist_info = f"""
+            User's long-term taste was extracted from their playlist ({len(playlist_context)} songs).
+            This was blended with their current mood/energy intent.
+            Sample playlist songs: {json.dumps(playlist_context[:5], indent=2)}
+            """
 
     system = f"""You are BeatBop, a music recommendation agent using ReAct (Reason + Act).
 
