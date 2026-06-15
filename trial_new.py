@@ -85,16 +85,21 @@ def extract_tracks_from_screenshot(image_bytes: bytes, media_type: str):
     return json.loads(raw)
 
 # ─── Playlist → Feature Vector ─────────────────────────────────────────────────
-def get_playlist_feature_vector(songs):
+def get_taste_embedding(songs):
+    """
+    Builds a weighted taste embedding from playlist songs.
+    Weights by popularity — more popular tracks = stronger preference signal.
+    Falls back to equal weights if popularity is unavailable.
+    """
     vectors = []
+    weights = []
+
     for item in songs:
         song_name = item['song'].lower().strip()
         artist_name = item['artist'].lower().strip()
 
-        # Match by song name first
         name_match = df[df['track_name'].str.lower().str.contains(song_name, na=False, regex=False)]
 
-        # If artist is available, narrow it down further
         if artist_name and not name_match.empty:
             artist_match = name_match[name_match['artists'].str.lower().str.contains(artist_name, na=False, regex=False)]
             match = artist_match if not artist_match.empty else name_match
@@ -102,11 +107,19 @@ def get_playlist_feature_vector(songs):
             match = name_match
 
         if not match.empty:
-            vectors.append(match[FEATURE_COLS].iloc[0].values)  # take first match, not mean
+            row = match.iloc[0]
+            vectors.append(row[FEATURE_COLS].values)
+            weights.append(float(row.get('popularity', 50)) + 1)  # +1 to avoid zero weight
 
-    if vectors:
-        return np.mean(vectors, axis=0).astype('float32')
-    return None
+    if not vectors:
+        return None
+
+    vectors = np.array(vectors, dtype='float32')
+    weights = np.array(weights, dtype='float32')
+    weights /= weights.sum()  # normalize to sum to 1
+
+    taste_vec = np.average(vectors, axis=0, weights=weights).astype('float32')
+    return taste_vec
 
 # ─── Filter → Feature Vector Mapping ──────────────────────────────────────────
 MOOD_VECTORS = {
@@ -236,7 +249,7 @@ with st.sidebar:
                                     type=["png", "jpg", "jpeg", "webp"])
 
     playlist_songs = current_chat().get("playlist_songs")
-    playlist_vec   = get_playlist_feature_vector(playlist_songs) if playlist_songs else None
+    playlist_vec   = get_taste_embedding(playlist_songs) if playlist_songs else None
 
     if uploaded_img and st.button("Extract Tracks"):
         with st.spinner("Reading screenshot with Groq Vision..."):
@@ -245,7 +258,7 @@ with st.sidebar:
                 songs = extract_tracks_from_screenshot(uploaded_img.read(), mt)
                 current_chat()["playlist_songs"] = songs
                 playlist_songs = songs
-                playlist_vec   = get_playlist_feature_vector(songs)
+                playlist_vec   = get_taste_embedding(songs)
                 st.success(f"✅ Extracted {len(songs)} tracks")
                 with st.expander("Detected songs"):
                     for s in songs[:15]:
