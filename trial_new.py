@@ -54,6 +54,50 @@ def load_and_index():
 df, faiss_index, scaler = load_and_index()
 st.success(f"✅ {len(df)} songs indexed and ready")
 
+# ─── Similarity graph with top 50 given by FAISS ───────────────────────────────────────
+def graph_rerank(candidates_df, query_vec, top_k=10, sim_threshold=0.85):
+    """
+    Re-rank FAISS candidates using a similarity graph to improve diversity.
+    Penalizes songs that are too similar to already-selected songs.
+    """
+    # Get normalized feature vectors for candidates
+    cand_features = scaler.transform(candidates_df[FEATURE_COLS].values).astype('float32')
+    query_norm = query_vec.flatten()
+
+    # Compute cosine similarity of each candidate to the query
+    def cosine_sim(a, b):
+        return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-8)
+
+    query_scores = np.array([cosine_sim(f, query_norm) for f in cand_features])
+
+    selected_indices = []
+    selected_vectors = []
+
+    for _ in range(top_k):
+        best_score = -1
+        best_idx = -1
+
+        for i, (score, vec) in enumerate(zip(query_scores, cand_features)):
+            if i in selected_indices:
+                continue
+
+            # Penalize if too similar to already selected songs
+            if selected_vectors:
+                max_sim_to_selected = max(cosine_sim(vec, s) for s in selected_vectors)
+                if max_sim_to_selected > sim_threshold:
+                    score *= (1 - max_sim_to_selected)  # diversity penalty
+
+            if score > best_score:
+                best_score = score
+                best_idx = i
+
+        if best_idx == -1:
+            break
+
+        selected_indices.append(best_idx)
+        selected_vectors.append(cand_features[best_idx])
+
+    return candidates_df.iloc[selected_indices].reset_index(drop=True)
 # ─── Screenshot → Songs via Groq Vision ───────────────────────────────────────
 def extract_tracks_from_screenshot(image_bytes: bytes, media_type: str):
     b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
@@ -183,10 +227,11 @@ def retrieve_songs(query_vec, genre=None, artist_filter=None, k=50):
     if genre and genre != "Any":
         results = results[results['track_genre'].str.lower() == genre.lower()]
     if artist_filter:
-        results = results[
-            results['artists'].str.lower().str.contains(artist_filter.lower(), na=False)
-        ]
-    return results.head(k)
+        results = results[results['artists'].str.lower().str.contains(artist_filter.lower(), na=False, regex=False)]
+
+    results = results.head(k)
+    results = graph_rerank(results, query_vec, top_k=15)  # ← add this line
+    return results
 
 # ─── ReAct Agent ───────────────────────────────────────────────────────────────
 def react_agent(user_query, retrieved_songs, filters, playlist_context=None):
