@@ -139,17 +139,38 @@ ENERGY_VECTORS = {
     "Low / Calm": dict(tempo=0.2, energy=0.2, acousticness=0.7),
 }
 
-def build_query_vector(mood=None, energy=None, genre=None, playlist_vec=None):
+def build_intent_vector(mood=None, energy=None):
+    """Short-term intent from explicit user input."""
     base = {col: 0.5 for col in FEATURE_COLS}
     if mood and mood in MOOD_VECTORS:
         base.update(MOOD_VECTORS[mood])
     if energy and energy in ENERGY_VECTORS:
         base.update(ENERGY_VECTORS[energy])
+    return np.array([base[c] for c in FEATURE_COLS], dtype='float32')
 
-    vec = np.array([base[c] for c in FEATURE_COLS], dtype='float32')
-    if playlist_vec is not None:
-        vec = 0.5 * vec + 0.5 * playlist_vec
-    return vec.reshape(1, -1)
+def blend_vectors(taste_vec=None, intent_vec=None, has_explicit_intent=False):
+    """
+    Blend long-term taste with short-term intent.
+    
+    - No playlist, no intent   → neutral vector (fallback)
+    - Playlist only            → 100% taste
+    - Intent only              → 100% intent  
+    - Both                     → 60% intent, 40% taste (intent takes lead when explicit)
+    """
+    if taste_vec is None and not has_explicit_intent:
+        # Cold start: return neutral
+        return np.array([0.5] * len(FEATURE_COLS), dtype='float32').reshape(1, -1)
+
+    if taste_vec is not None and not has_explicit_intent:
+        return taste_vec.reshape(1, -1)
+
+    if taste_vec is None and has_explicit_intent:
+        return intent_vec.reshape(1, -1)
+
+    # Both available — intent leads
+    alpha = 0.6  # weight for intent
+    blended = alpha * intent_vec + (1 - alpha) * taste_vec
+    return blended.reshape(1, -1)
 
 # ─── RAG Retrieval ─────────────────────────────────────────────────────────────
 def retrieve_songs(query_vec, genre=None, artist_filter=None, k=50):
@@ -335,11 +356,15 @@ if prompt := st.chat_input("🎤 Tell me what you're in the mood for..."):
 
     with st.chat_message("assistant"):
         with st.spinner("Finding your perfect songs..."):
-            query_vec = build_query_vector(
+            has_intent = (mood != "Any") or (energy != "Any")
+            intent_vec = build_intent_vector(
                 mood=mood if mood != "Any" else None,
-                energy=energy if energy != "Any" else None,
-                genre=genre if genre != "Any" else None,
-                playlist_vec=playlist_vec
+                energy=energy if energy != "Any" else None
+            )
+            query_vec = blend_vectors(
+                taste_vec=playlist_vec,
+                intent_vec=intent_vec,
+                has_explicit_intent=has_intent
             )
             retrieved = retrieve_songs(
                 query_vec,
